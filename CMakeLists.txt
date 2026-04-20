@@ -11,7 +11,7 @@ add_executable(example main.cpp)
 target_include_directories(example PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Линкуемся с TBB
-target_link_libraries(example PRIVATE TBB::tbb)
+target_link_libraries(example PRIVATE TBB::tbb )
 
 # Включить поддержку C++17 (или новее) для requires в constexpr if
 set_target_properties(example PROPERTIES
@@ -19,19 +19,25 @@ set_target_properties(example PROPERTIES
     CXX_STANDARD_REQUIRED ON
 )
 
+find_package(benchmark REQUIRED)
 
 
-# Исполняемый файл примера
-add_executable(bench bench.cpp)
+macro(AddBench bench)
+    # Исполняемый файл примера
+    add_executable(${bench} ${bench}.cpp)
 
-# Подключаем заголовочный файл (он лежит рядом)
-target_include_directories(bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    # Подключаем заголовочный файл (он лежит рядом)
+    target_include_directories(${bench} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
-# Линкуемся с TBB
-target_link_libraries(bench PRIVATE TBB::tbb)
+    # Линкуемся с TBB
+    target_link_libraries(${bench} PRIVATE TBB::tbb benchmark::benchmark)
 
-# Включить поддержку C++17 (или новее) для requires в constexpr if
-set_target_properties(bench PROPERTIES
-    CXX_STANDARD 20
-    CXX_STANDARD_REQUIRED ON
-)
+    # Включить поддержку C++17 (или новее) для requires в constexpr if
+    set_target_properties(${bench} PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+    )
+endmacro(AddBench)
+
+AddBench("bench")
+AddBench("compress_bench")
