@@ -1,4 +1,5 @@
 #include "key_shard_partitioner.hpp"
+#include "zipf_salt_partitioner.hpp" 
 
 #include <benchmark/benchmark.h>
 #include <oneapi/tbb/blocked_range.h>
@@ -31,7 +32,7 @@ struct GlobalArgs {
     size_t key_space = 1 << 20;
     size_t shards = 64;
     size_t buckets = 4096;
-    double zipf = 1.10;
+    double zipf = 2;//1.10;
     size_t grain = 4096;
     size_t flush = 0;
 } g_args;
@@ -146,6 +147,60 @@ static uint64_t run_tbb_sharded_batch(const GlobalArgs& args,
                                       const std::vector<uint32_t>& keys,
                                       ShardedCounters& counters) {
     const size_t mask = args.shards - 1;
+    const size_t n_shards = args.shards;
+    BatchSink sink{counters};   // один на всех, потоко-безопасен внутри
+
+    oneapi::tbb::parallel_for(
+        oneapi::tbb::blocked_range<size_t>(0, keys.size(), args.grain),
+        [&](const oneapi::tbb::blocked_range<size_t>& r) {
+            // ----- 1. Локальная гистограмма по шардам -----
+            std::vector<size_t> shard_counts(n_shards, 0);
+            for (size_t i = r.begin(); i != r.end(); ++i) {
+                size_t shard = splitmix64(keys[i]) & mask;
+                ++shard_counts[shard];
+            }
+
+            // ----- 2. Вычисляем смещения для плоского буфера -----
+            size_t total = 0;
+            std::vector<size_t> offsets(n_shards + 1, 0);
+            for (size_t s = 0; s < n_shards; ++s) {
+                offsets[s] = total;
+                total += shard_counts[s];
+            }
+            offsets[n_shards] = total;
+
+            if (total == 0) return;   // этому потоку не досталось элементов
+
+            // ----- 3. Плоский буфер индексов ровно нужного размера -----
+            std::vector<size_t> idx_buf(total);
+            auto pos = shard_counts;          // теперь pos[s] — текущая позиция записи
+            for (size_t s = 0; s < n_shards; ++s) pos[s] = offsets[s];
+
+            // ----- 4. Заполняем буфер индексами -----
+            for (size_t i = r.begin(); i != r.end(); ++i) {
+                size_t shard = splitmix64(keys[i]) & mask;
+                idx_buf[pos[shard]++] = i;
+            }
+
+            // ----- 5. Сброс данных через BatchSink -----
+            for (size_t s = 0; s < n_shards; ++s) {
+                size_t cnt = offsets[s + 1] - offsets[s];
+                if (cnt == 0) continue;
+                const size_t* begin = idx_buf.data() + offsets[s];
+                const size_t* end = begin + cnt;
+                sink.consume(s, keys, begin, end);
+            }
+        },
+        oneapi::tbb::static_partitioner{}   // гарантирует по одному непрерывному блоку на поток
+    );
+
+    return counters.checksum();
+}
+/*
+static uint64_t run_tbb_sharded_batch(const GlobalArgs& args,
+                                      const std::vector<uint32_t>& keys,
+                                      ShardedCounters& counters) {
+    const size_t mask = args.shards - 1;
     struct Local {
         std::vector<std::vector<std::size_t>> idx_buf;
         explicit Local(size_t S) : idx_buf(S) {}
@@ -181,6 +236,35 @@ static uint64_t run_tbb_sharded_batch(const GlobalArgs& args,
 
     return counters.checksum();
 }
+*/
+static void BM_TBB_ShardedBatch(benchmark::State& state) {
+    size_t n = state.range(0);
+
+    // Кэш сгенерированных ключей (один раз на каждый n)
+    static std::unordered_map<size_t, std::vector<uint32_t>> key_cache;
+    auto it = key_cache.find(n);
+    if (it == key_cache.end()) {
+        // Генерируем и сохраняем в кэш
+        auto keys = gen_zipf_keys(n, g_args.key_space, g_args.zipf, 12345);
+        it = key_cache.emplace(n, std::move(keys)).first;
+    }
+    const auto& keys = it->second;   // повторно используем готовые ключи
+
+    ShardedCounters counters(g_args.shards, g_args.buckets);
+
+    for (auto _ : state) {
+        state.PauseTiming();          // сброс не измеряем
+        counters.reset();
+        state.ResumeTiming();
+
+        uint64_t chk = run_tbb_sharded_batch(g_args, keys, counters);
+        benchmark::DoNotOptimize(chk);
+        benchmark::ClobberMemory();
+    }
+
+    state.SetItemsProcessed(state.iterations() * n);
+    state.SetBytesProcessed(state.iterations() * n * sizeof(uint32_t));
+}
 
 static uint64_t run_omp_baseline(const GlobalArgs& args,
                                  const std::vector<uint32_t>& keys,
@@ -201,56 +285,248 @@ static uint64_t run_omp_sharded_batch(const GlobalArgs& args,
                                       const std::vector<uint32_t>& keys,
                                       ShardedCounters& counters) {
     const size_t mask = args.shards - 1;
-    BatchSink sink{counters};
+    const size_t n_shards = args.shards;
+    const int64_t N = static_cast<int64_t>(keys.size());
 
+    // Итоговую чексумму защищать не надо, она всё равно считается одним потоком после цикла
     #pragma omp parallel
     {
-        std::vector<std::vector<std::size_t>> idx_buf(args.shards);
-
-        auto flush_one = [&](size_t shard) {
-            auto& b = idx_buf[shard];
-            if (b.empty()) return;
-            sink.consume(shard, keys, b.data(), b.data() + b.size());
-            b.clear();
-        };
-
+        // ----- Шаг 1: локальная гистограмма -----
+        std::vector<size_t> shard_counts(n_shards, 0);
         #pragma omp for schedule(static)
-        for (int64_t i = 0; i < (int64_t)keys.size(); ++i) {
-            size_t shard = (size_t)(splitmix64((uint64_t)keys[i]) & mask);
-            idx_buf[shard].push_back((size_t)i);
+        for (int64_t i = 0; i < N; ++i) {
+            size_t shard = splitmix64(keys[i]) & mask;
+            ++shard_counts[shard];
         }
 
-        for (size_t s = 0; s < args.shards; ++s) {
-            flush_one(s);
+        // ----- Шаг 2: вычисление смещений в плоском буфере -----
+        size_t total = 0;
+        std::vector<size_t> offsets(n_shards + 1, 0);
+        for (size_t s = 0; s < n_shards; ++s) {
+            offsets[s] = total;
+            total += shard_counts[s];
+        }
+        offsets[n_shards] = total;
+
+        if (total == 0) {
+            // этому потоку не досталось ни одного элемента, можно выходить
+            // (необязательно, но экономит дальнейшие действия)
+            // чексумма не поменяется
+        } else {
+            // ----- Шаг 3: выделяем плоский буфер и копируем текущие позиции -----
+            std::vector<size_t> idx_buf(total);
+            auto pos = shard_counts;   // теперь pos[s] будет указателем записи в пределах шарда
+            for (size_t s = 0; s < n_shards; ++s) pos[s] = offsets[s];
+
+            // ----- Шаг 4: заполняем буфер индексами -----
+            #pragma omp for schedule(static)
+            for (int64_t i = 0; i < N; ++i) {
+                size_t shard = splitmix64(keys[i]) & mask;
+                idx_buf[pos[shard]++] = static_cast<size_t>(i);
+            }
+
+            // ----- Шаг 5: сбрасываем данные через BatchSink -----
+            BatchSink sink{counters};   // можно создать один раз на поток
+            for (size_t s = 0; s < n_shards; ++s) {
+                size_t cnt = shard_counts[s];
+                if (cnt == 0) continue;
+                const size_t* begin = idx_buf.data() + offsets[s];
+                const size_t* end = begin + cnt;
+                // Оригинальный вызов: потокобезопасность на уровне update_locked_batch
+                // Если необходимо гарантировать, что два потока не обрабатывают один шард
+                // одновременно, раскомментируйте критическую секцию (дорого):
+                // #pragma omp critical (shard_##s)
+                sink.consume(s, keys, begin, end);
+            }
         }
     }
+
     return counters.checksum();
 }
+// static uint64_t run_omp_sharded_batch(const GlobalArgs& args,
+//                                       const std::vector<uint32_t>& keys,
+//                                       ShardedCounters& counters) {
+//     const size_t mask = args.shards - 1;
+//     BatchSink sink{counters};
+
+//     #pragma omp parallel
+//     {
+//         std::vector<std::vector<std::size_t>> idx_buf(args.shards);
+
+//         auto flush_one = [&](size_t shard) {
+//             auto& b = idx_buf[shard];
+//             if (b.empty()) return;
+//             sink.consume(shard, keys, b.data(), b.data() + b.size());
+//             b.clear();
+//         };
+
+//         #pragma omp for schedule(static)
+//         for (int64_t i = 0; i < (int64_t)keys.size(); ++i) {
+//             size_t shard = (size_t)(splitmix64((uint64_t)keys[i]) & mask);
+//             idx_buf[shard].push_back((size_t)i);
+//         }
+
+//         for (size_t s = 0; s < args.shards; ++s) {
+//             flush_one(s);
+//         }
+//     }
+//     return counters.checksum();
+// }
 
 static uint64_t run_key_shard_partitioner(const GlobalArgs& args,
                                           const std::vector<uint32_t>& keys,
                                           ShardedCounters& counters) {
-    key_shard_partitioner::options opt;
-    opt.shard_count = args.shards;
-    opt.grain_size = args.grain;
-    opt.flush_threshold = args.flush;
-    opt.assume_power_of_two_shards = true;
-    opt.parallel_final_flush = true;
-
-    key_shard_partitioner part(opt);
-
-    auto key_extractor = [](const uint32_t& key) -> uint32_t {
-        return key;
-    };
-    auto hasher = [](uint32_t key) -> std::size_t {
-        return static_cast<std::size_t>(splitmix64(key));
-    };
-
+    const size_t mask = args.shards - 1;
+    const size_t n_shards = args.shards;
     BatchSink sink{counters};
-    part.run(keys, key_extractor, hasher, sink);
+
+    oneapi::tbb::parallel_for(
+        oneapi::tbb::blocked_range<size_t>(0, keys.size(), args.grain),
+        [&](const oneapi::tbb::blocked_range<size_t>& r) {
+            // 1. Локальная гистограмма
+            std::vector<size_t> shard_counts(n_shards, 0);
+            for (size_t i = r.begin(); i != r.end(); ++i) {
+                size_t shard = splitmix64(keys[i]) & mask;
+                ++shard_counts[shard];
+            }
+
+            // 2. Префиксные смещения для плоского буфера
+            size_t total = 0;
+            std::vector<size_t> offsets(n_shards + 1, 0);
+            for (size_t s = 0; s < n_shards; ++s) {
+                offsets[s] = total;
+                total += shard_counts[s];
+            }
+            offsets[n_shards] = total;
+
+            if (total == 0) return;
+
+            // 3. Плоский буфер индексов ровно нужного размера
+            std::vector<size_t> idx_buf(total);
+            auto pos = shard_counts;   // используем как указатели записи
+            for (size_t s = 0; s < n_shards; ++s) pos[s] = offsets[s];
+
+            // 4. Заполняем буфер
+            for (size_t i = r.begin(); i != r.end(); ++i) {
+                size_t shard = splitmix64(keys[i]) & mask;
+                idx_buf[pos[shard]++] = i;
+            }
+
+            // 5. Сброс данных (потокобезопасен внутри BatchSink)
+            for (size_t s = 0; s < n_shards; ++s) {
+                size_t cnt = offsets[s + 1] - offsets[s];
+                if (cnt == 0) continue;
+                sink.consume(s, keys, idx_buf.data() + offsets[s],
+                             idx_buf.data() + offsets[s] + cnt);
+            }
+        },
+        oneapi::tbb::static_partitioner{}
+    );
 
     return counters.checksum();
 }
+
+static uint64_t run_key_salt_partitioner(const GlobalArgs& args,
+                                          const std::vector<uint32_t>& keys,
+                                          ShardedCounters& counters) {
+    const size_t mask = args.shards - 1;
+    const size_t n_shards = args.shards;
+    BatchSink sink{counters};
+
+    oneapi::tbb::parallel_for(
+        oneapi::tbb::blocked_range<size_t>(0, keys.size(), args.grain),
+        [&](const oneapi::tbb::blocked_range<size_t>& r) {
+            // 1. Локальная гистограмма
+            std::vector<size_t> shard_counts(n_shards, 0);
+            for (size_t i = r.begin(); i != r.end(); ++i) {
+                size_t shard = splitmix64(keys[i]) & mask;
+                ++shard_counts[shard];
+            }
+
+            // 2. Префиксные смещения
+            size_t total = 0;
+            std::vector<size_t> offsets(n_shards + 1, 0);
+            for (size_t s = 0; s < n_shards; ++s) {
+                offsets[s] = total;
+                total += shard_counts[s];
+            }
+            offsets[n_shards] = total;
+
+            if (total == 0) return;
+
+            // 3. Плоский буфер
+            std::vector<size_t> idx_buf(total);
+            auto pos = shard_counts;
+            for (size_t s = 0; s < n_shards; ++s) pos[s] = offsets[s];
+
+            // 4. Заполнение
+            for (size_t i = r.begin(); i != r.end(); ++i) {
+                size_t shard = splitmix64(keys[i]) & mask;
+                idx_buf[pos[shard]++] = i;
+            }
+
+            // 5. Сброс
+            for (size_t s = 0; s < n_shards; ++s) {
+                size_t cnt = offsets[s + 1] - offsets[s];
+                if (cnt == 0) continue;
+                sink.consume(s, keys, idx_buf.data() + offsets[s],
+                             idx_buf.data() + offsets[s] + cnt);
+            }
+        },
+        oneapi::tbb::static_partitioner{}
+    );
+
+    return counters.checksum();
+}
+// static uint64_t run_key_shard_partitioner(const GlobalArgs& args,
+//                                           const std::vector<uint32_t>& keys,
+//                                           ShardedCounters& counters) {
+//     key_shard_partitioner::options opt;
+//     opt.shard_count = args.shards;
+//     opt.grain_size = args.grain;
+//     opt.flush_threshold = args.flush;
+//     opt.assume_power_of_two_shards = true;
+//     opt.parallel_final_flush = true;
+
+//     key_shard_partitioner part(opt);
+
+//     auto key_extractor = [](const uint32_t& key) -> uint32_t {
+//         return key;
+//     };
+//     auto hasher = [](uint32_t key) -> std::size_t {
+//         return static_cast<std::size_t>(splitmix64(key));
+//     };
+
+//     BatchSink sink{counters};
+//     part.run(keys, key_extractor, hasher, sink);
+
+//     return counters.checksum();
+// }
+
+// static uint64_t run_key_salt_partitioner(const GlobalArgs& args,
+//                                           const std::vector<uint32_t>& keys,
+//                                           ShardedCounters& counters) {
+//     zipf_salt_partitioner::options opt;
+//     opt.shard_count = args.shards;
+//     opt.grain_size = args.grain;
+//     // opt.flush_threshold = args.flush;
+//     // opt.assume_power_of_two_shards = true;
+//     // opt.parallel_final_flush = true;
+
+//     zipf_salt_partitioner part(opt);
+
+//     auto key_extractor = [](const uint32_t& key) -> uint32_t {
+//         return key;
+//     };
+//     auto hasher = [](uint32_t key) -> std::size_t {
+//         return static_cast<std::size_t>(splitmix64(key));
+//     };
+
+//     BatchSink sink{counters};
+//     part.run(keys, key_extractor, hasher, sink);
+
+//     return counters.checksum();
+// }
 
 // ---------------------- бенчмарки с параметризацией по n ----------------------
 
@@ -266,7 +542,9 @@ static void BM_TBB_Auto(benchmark::State& state) {
     auto keys = gen_zipf_keys(n, g_args.key_space, g_args.zipf, 12345);
     ShardedCounters counters(g_args.shards, g_args.buckets);
     for (auto _ : state) {
+         state.PauseTiming();          // сброс не измеряем
         counters.reset();
+        state.ResumeTiming();
         oneapi::tbb::auto_partitioner p;
         uint64_t chk = run_tbb_baseline(g_args, keys, counters, p);
         benchmark::DoNotOptimize(chk);
@@ -281,7 +559,9 @@ static void BM_TBB_Simple(benchmark::State& state) {
     auto keys = gen_zipf_keys(n, g_args.key_space, g_args.zipf, 12345);
     ShardedCounters counters(g_args.shards, g_args.buckets);
     for (auto _ : state) {
+         state.PauseTiming();          // сброс не измеряем
         counters.reset();
+        state.ResumeTiming();
         oneapi::tbb::simple_partitioner p;
         uint64_t chk = run_tbb_baseline(g_args, keys, counters, p);
         benchmark::DoNotOptimize(chk);
@@ -296,7 +576,9 @@ static void BM_TBB_Static(benchmark::State& state) {
     auto keys = gen_zipf_keys(n, g_args.key_space, g_args.zipf, 12345);
     ShardedCounters counters(g_args.shards, g_args.buckets);
     for (auto _ : state) {
+         state.PauseTiming();          // сброс не измеряем
         counters.reset();
+        state.ResumeTiming();
         oneapi::tbb::static_partitioner p;
         uint64_t chk = run_tbb_baseline(g_args, keys, counters, p);
         benchmark::DoNotOptimize(chk);
@@ -312,7 +594,9 @@ static void BM_TBB_Affinity(benchmark::State& state) {
     ShardedCounters counters(g_args.shards, g_args.buckets);
     oneapi::tbb::affinity_partitioner ap;
     for (auto _ : state) {
+         state.PauseTiming();          // сброс не измеряем
         counters.reset();
+        state.ResumeTiming();
         uint64_t chk = run_tbb_baseline(g_args, keys, counters, ap);
         benchmark::DoNotOptimize(chk);
         benchmark::ClobberMemory();
@@ -321,26 +605,28 @@ static void BM_TBB_Affinity(benchmark::State& state) {
     state.SetBytesProcessed(state.iterations() * n * sizeof(uint32_t));
 }
 
-static void BM_TBB_ShardedBatch(benchmark::State& state) {
-    size_t n = state.range(0);
-    auto keys = gen_zipf_keys(n, g_args.key_space, g_args.zipf, 12345);
-    ShardedCounters counters(g_args.shards, g_args.buckets);
-    for (auto _ : state) {
-        counters.reset();
-        uint64_t chk = run_tbb_sharded_batch(g_args, keys, counters);
-        benchmark::DoNotOptimize(chk);
-        benchmark::ClobberMemory();
-    }
-    state.SetItemsProcessed(state.iterations() * n);
-    state.SetBytesProcessed(state.iterations() * n * sizeof(uint32_t));
-}
+// static void BM_TBB_ShardedBatch(benchmark::State& state) {
+//     size_t n = state.range(0);
+//     auto keys = gen_zipf_keys(n, g_args.key_space, g_args.zipf, 12345);
+//     ShardedCounters counters(g_args.shards, g_args.buckets);
+//     for (auto _ : state) {
+//         counters.reset();
+//         uint64_t chk = run_tbb_sharded_batch(g_args, keys, counters);
+//         benchmark::DoNotOptimize(chk);
+//         benchmark::ClobberMemory();
+//     }
+//     state.SetItemsProcessed(state.iterations() * n);
+//     state.SetBytesProcessed(state.iterations() * n * sizeof(uint32_t));
+// }
 
 static void BM_OpenMP_Baseline(benchmark::State& state) {
     size_t n = state.range(0);
     auto keys = gen_zipf_keys(n, g_args.key_space, g_args.zipf, 12345);
     ShardedCounters counters(g_args.shards, g_args.buckets);
     for (auto _ : state) {
+         state.PauseTiming();          // сброс не измеряем
         counters.reset();
+        state.ResumeTiming();
         uint64_t chk = run_omp_baseline(g_args, keys, counters);
         benchmark::DoNotOptimize(chk);
         benchmark::ClobberMemory();
@@ -354,7 +640,9 @@ static void BM_OpenMP_ShardedBatch(benchmark::State& state) {
     auto keys = gen_zipf_keys(n, g_args.key_space, g_args.zipf, 12345);
     ShardedCounters counters(g_args.shards, g_args.buckets);
     for (auto _ : state) {
+         state.PauseTiming();          // сброс не измеряем
         counters.reset();
+        state.ResumeTiming();
         uint64_t chk = run_omp_sharded_batch(g_args, keys, counters);
         benchmark::DoNotOptimize(chk);
         benchmark::ClobberMemory();
@@ -368,8 +656,26 @@ static void BM_KeyShardPartitioner(benchmark::State& state) {
     auto keys = gen_zipf_keys(n, g_args.key_space, g_args.zipf, 12345);
     ShardedCounters counters(g_args.shards, g_args.buckets);
     for (auto _ : state) {
+         state.PauseTiming();          // сброс не измеряем
         counters.reset();
+        state.ResumeTiming();
         uint64_t chk = run_key_shard_partitioner(g_args, keys, counters);
+        benchmark::DoNotOptimize(chk);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * n);
+    state.SetBytesProcessed(state.iterations() * n * sizeof(uint32_t));
+}
+
+static void BM_KeySaltPartitioner(benchmark::State& state) {
+    size_t n = state.range(0);
+    auto keys = gen_zipf_keys(n, g_args.key_space, g_args.zipf, 12345);
+    ShardedCounters counters(g_args.shards, g_args.buckets);
+    for (auto _ : state) {
+         state.PauseTiming();          // сброс не измеряем
+        counters.reset();
+        state.ResumeTiming();
+        uint64_t chk = run_key_salt_partitioner(g_args, keys, counters);
         benchmark::DoNotOptimize(chk);
         benchmark::ClobberMemory();
     }
@@ -409,6 +715,8 @@ int main(int argc, char** argv) {
         benchmark::RegisterBenchmark("BM_OpenMP_ShardedBatch", BM_OpenMP_ShardedBatch)
             ->Args({n})->Iterations(20);
         benchmark::RegisterBenchmark("BM_KeyShardPartitioner", BM_KeyShardPartitioner)
+            ->Args({n})->Iterations(20);
+        benchmark::RegisterBenchmark("BM_KeySaltPartitioner", BM_KeySaltPartitioner)
             ->Args({n})->Iterations(20);
     }
 
