@@ -1,33 +1,33 @@
-// zipf_p2c_partitioner.hpp
 #ifndef ZIPF_P2C_PARTITIONER_HPP
 #define ZIPF_P2C_PARTITIONER_HPP
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 #include <utility>
-#include <thread>
 #include <algorithm>
-#include <future>
+#include <memory>
+#include <atomic>
+#include <tbb/task_group.h>
 
 class zipf_p2c_partitioner {
 public:
     struct options {
         std::size_t shard_count = 64;
-        std::size_t grain_size = 2048;          // не используется (бенчмарк переопределяет)
-        std::size_t flush_threshold = 0;        // не используется
+        std::size_t grain_size = 2048;
+        std::size_t flush_threshold = 0;
         unsigned int num_threads = 0;
         bool assume_power_of_two_shards = true;
-        bool parallel_final_flush = true;       // не используется
-        bool reuse_threads = true;              // не используется
-
-        // Дополнительный seed для второго хеша (можно менять при необходимости)
-        std::uint64_t salt_for_second_hash = 0x9E3779B97F4A7C15ULL;
+        bool reuse_threads = true;          // более не используется
+        bool use_dual_hash = true;          // true = h1 и h2 из 64‑битного хеша
     };
 
     explicit zipf_p2c_partitioner(options opt) : opt_(std::move(opt)) {
         if (opt_.num_threads == 0)
             opt_.num_threads = std::max(1u, std::thread::hardware_concurrency());
     }
+
+    ~zipf_p2c_partitioner() = default;
 
     template <class Items, class KeyExtractor, class Hasher, class ShardSink>
     void run(const Items& items,
@@ -41,17 +41,20 @@ public:
         const unsigned int P = opt_.num_threads;
 
         auto ranges = split_range(n, P);
-        std::vector<std::future<void>> futures;
-        futures.reserve(P);
 
+        std::vector<std::function<void()>> tasks;
+        tasks.reserve(P);
         for (unsigned int t = 0; t < P; ++t) {
-            futures.push_back(std::async(std::launch::async, [&, t]() {
-                process_p2c_range(ranges[t].first, ranges[t].second,
+            tasks.emplace_back([this, t, &ranges, &items, &key_of, &hasher, S, &sink]() {
+                process_and_flush(ranges[t].first, ranges[t].second,
                                   items, key_of, hasher, S, sink);
-            }));
+            });
         }
 
-        for (auto& f : futures) f.get();
+        tbb::task_group tg;
+        for (auto& task : tasks)
+            tg.run(std::move(task));
+        tg.wait();
 
         if constexpr (requires(ShardSink s) { s.finalize(); }) {
             sink.finalize();
@@ -60,6 +63,105 @@ public:
 
 private:
     options opt_;
+
+    template <class Items, class KeyExtractor, class Hasher, class ShardSink>
+    void process_and_flush(std::size_t begin, std::size_t end,
+                           const Items& items,
+                           KeyExtractor& key_of,
+                           Hasher& hasher,
+                           std::size_t S,
+                           ShardSink& sink) const {
+        const std::size_t range_len = end - begin;
+        if (range_len == 0) return;
+
+        std::vector<std::vector<std::size_t>> local_bufs(S);
+        constexpr std::size_t INITIAL_CAP = 256;
+        for (auto& buf : local_bufs)
+            buf.reserve(INITIAL_CAP);
+
+        std::vector<std::size_t> cnt(S, 0);
+        std::size_t* cnt_ptr = cnt.data();
+
+        const bool pow2 = opt_.assume_power_of_two_shards;
+        const bool dual_hash = opt_.use_dual_hash;
+        const std::size_t mask = S - 1;
+
+        if (pow2) {
+            if (dual_hash) {
+                for (std::size_t i = begin; i < end; ++i) {
+                    const auto& item = items[i];
+                    auto key = key_of(item);
+                    auto full_hash = static_cast<std::size_t>(hasher(key));
+                    std::size_t h1 = full_hash;
+                    std::size_t h2 = full_hash >> 32;
+                    std::size_t s1 = h1 & mask;
+                    std::size_t s2 = h2 & mask;
+                    std::size_t chosen = (cnt_ptr[s1] <= cnt_ptr[s2]) ? s1 : s2;
+                    ++cnt_ptr[chosen];
+                    auto& buf = local_bufs[chosen];
+                    if (__builtin_expect(buf.size() == buf.capacity(), 0))
+                        buf.reserve(buf.capacity() * 2);
+                    buf.push_back(i);
+                }
+            } else {
+                for (std::size_t i = begin; i < end; ++i) {
+                    const auto& item = items[i];
+                    auto key = key_of(item);
+                    std::size_t h1 = static_cast<std::size_t>(hasher(key));
+                    std::size_t h2 = mix_bits(h1);
+                    std::size_t s1 = h1 & mask;
+                    std::size_t s2 = h2 & mask;
+                    std::size_t chosen = (cnt_ptr[s1] <= cnt_ptr[s2]) ? s1 : s2;
+                    ++cnt_ptr[chosen];
+                    auto& buf = local_bufs[chosen];
+                    if (__builtin_expect(buf.size() == buf.capacity(), 0))
+                        buf.reserve(buf.capacity() * 2);
+                    buf.push_back(i);
+                }
+            }
+        } else {
+            if (dual_hash) {
+                for (std::size_t i = begin; i < end; ++i) {
+                    const auto& item = items[i];
+                    auto key = key_of(item);
+                    auto full_hash = static_cast<std::size_t>(hasher(key));
+                    std::size_t h1 = full_hash;
+                    std::size_t h2 = full_hash >> 32;
+                    std::size_t s1 = h1 % S;
+                    std::size_t s2 = h2 % S;
+                    std::size_t chosen = (cnt_ptr[s1] <= cnt_ptr[s2]) ? s1 : s2;
+                    ++cnt_ptr[chosen];
+                    auto& buf = local_bufs[chosen];
+                    if (__builtin_expect(buf.size() == buf.capacity(), 0))
+                        buf.reserve(buf.capacity() * 2);
+                    buf.push_back(i);
+                }
+            } else {
+                for (std::size_t i = begin; i < end; ++i) {
+                    const auto& item = items[i];
+                    auto key = key_of(item);
+                    std::size_t h1 = static_cast<std::size_t>(hasher(key));
+                    std::size_t h2 = mix_bits(h1);
+                    std::size_t s1 = h1 % S;
+                    std::size_t s2 = h2 % S;
+                    std::size_t chosen = (cnt_ptr[s1] <= cnt_ptr[s2]) ? s1 : s2;
+                    ++cnt_ptr[chosen];
+                    auto& buf = local_bufs[chosen];
+                    if (__builtin_expect(buf.size() == buf.capacity(), 0))
+                        buf.reserve(buf.capacity() * 2);
+                    buf.push_back(i);
+                }
+            }
+        }
+
+        for (std::size_t s = 0; s < S; ++s) {
+            auto& buf = local_bufs[s];
+            if (!buf.empty()) {
+                sink.consume(s, items, buf.data(), buf.data() + buf.size());
+                buf.clear();
+            }
+        }
+    }
 
     static std::size_t normalize_shards(std::size_t s) { return s < 1 ? 1 : s; }
 
@@ -77,7 +179,6 @@ private:
         return ranges;
     }
 
-    // Быстрый миксер бит для получения второго хеша из первого
     static std::size_t mix_bits(std::size_t x) {
         x ^= x >> 33;
         x *= 0xff51afd7ed558ccdULL;
@@ -85,48 +186,6 @@ private:
         x *= 0xc4ceb9fe1a85ec53ULL;
         x ^= x >> 33;
         return x;
-    }
-
-    template <class Items, class KeyExtractor, class Hasher, class ShardSink>
-    void process_p2c_range(std::size_t begin, std::size_t end,
-                           const Items& items,
-                           KeyExtractor&& key_of,
-                           Hasher&& hasher,
-                           std::size_t S,
-                           ShardSink& sink) const {
-        // Локальный массив счётчиков занятости шардов и буферы индексов
-        std::vector<std::size_t> shard_sizes(S, 0);
-        std::vector<std::vector<std::size_t>> local_buffers(S);
-        std::size_t estimated = (end - begin) / S + 1;
-        for (auto& buf : local_buffers) buf.reserve(estimated);
-
-        for (std::size_t i = begin; i < end; ++i) {
-            const auto& item = items[i];
-            const auto key = key_of(item);
-            std::size_t h1 = static_cast<std::size_t>(hasher(key));
-
-            // Второй хеш, независимый от первого
-            std::size_t h2 = mix_bits(h1 ^ opt_.salt_for_second_hash);
-
-            // Индексы двух шардов
-            std::size_t s1 = (opt_.assume_power_of_two_shards) ? (h1 & (S - 1)) : (h1 % S);
-            std::size_t s2 = (opt_.assume_power_of_two_shards) ? (h2 & (S - 1)) : (h2 % S);
-
-            // Выбор менее заполненного шарда в локальном буфере
-            std::size_t chosen = (shard_sizes[s1] <= shard_sizes[s2]) ? s1 : s2;
-
-            local_buffers[chosen].push_back(i);
-            ++shard_sizes[chosen];
-        }
-
-        // Сброс накопленных индексов в приёмник
-        for (std::size_t s = 0; s < S; ++s) {
-            auto& buf = local_buffers[s];
-            if (!buf.empty()) {
-                sink.consume(s, items, buf.data(), buf.data() + buf.size());
-                buf.clear();
-            }
-        }
     }
 };
 
